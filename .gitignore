@@ -1,0 +1,36 @@
+# Compiled binaries
+/dist/
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test
+*.test
+*.out
+coverage.txt
+
+# Go
+vendor/
+.vendor-new/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Config with secrets
+config.yaml
+config.local.yaml
+.env
+*.log
+
+# Position files (runtime state)
+*.pos
+data/
+
+# OS
+.DS_Store
+Thumbs.db

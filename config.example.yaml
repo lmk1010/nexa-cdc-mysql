@@ -1,0 +1,80 @@
+# nexa-cdc-mysql config
+#
+# Source: MySQL you want to READ binlog FROM (usually production CDB).
+# Sink:   MySQL you WRITE to (usually a warehouse / DW instance).
+
+source:
+  host: source-mysql.example.com
+  port: 3306
+  user: canal
+  password: "changeme"
+  server_id: 1101              # unique among replicas; keep different from source's real slaves
+  binlog_start:                # optional; omit to start from current tail
+    file: mysql-bin.000184     # optional; if omitted, uses SHOW MASTER STATUS
+    position: 0
+
+sink:
+  host: warehouse.example.com
+  port: 3306
+  user: root
+  password: "changeme"
+  database: ordersys_dw
+  max_conn: 4
+  # 每批最多累积多少行再 commit（越大吞吐越高、峰值内存越大）
+  batch_max_rows: 500
+  # 批 flush 间隔 ms（不足 batch_max_rows 时也定期 commit）
+  batch_flush_ms: 500
+
+# 只同步这些表 —— 前缀匹配。分表 t_order_revoke_0..N 会被自动归一化到 t_order_revoke。
+tables:
+  include:
+    - order-sys.t_task
+    - order-sys.t_task_assignee
+    - order-sys.t_task_subtask
+    - order-sys.t_order_pf
+    - order-sys.t_order_pf_seller
+    - order-sys.t_order_revoke_[0-9]+   # 分表 regex
+    - order-sys.sys_user
+    - order-sys.sys_dept
+
+# 分表归一化规则（可选）：把 shard 表统一写到一张目标表
+shard_normalize:
+  - pattern: '^order-sys\.t_order_revoke_[0-9]+$'
+    target: t_order_revoke
+
+# 首次启动时，若目标表为空 → 全量拉取（SELECT）
+initial_load:
+  enabled: true
+  # 每批 SELECT 多少行
+  chunk_size: 5000
+  # 完成后从当前 binlog 尾切换到增量
+
+# 位点持久化
+position_store:
+  # 本地文件（快速恢复）
+  file: /var/lib/nexa-cdc/position.yaml
+  # 同时落到 warehouse 的 _canal_stats 表（方便运维监控）
+  sink_db_table: _canal_stats
+
+# 断线重连策略
+reconnect:
+  # 多久没收到 event 视作静默死亡 → 主动 disconnect+reconnect
+  idle_timeout_ms: 60000
+  # 指数 backoff
+  min_backoff_ms: 2000
+  max_backoff_ms: 30000
+
+# HTTP endpoints (health / metrics)
+http:
+  addr: 0.0.0.0:6060
+  # /health   → docker healthcheck
+  # /metrics  → prometheus scrape
+  # /stats    → 快速 debug（json 格式当前统计）
+
+# 日志
+log:
+  level: info          # debug / info / warn / error
+  format: text         # text / json
+
+# 运行模式
+mode: normal           # normal / dry-run（只解析不写 sink）
