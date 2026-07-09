@@ -8,10 +8,13 @@ package syncer
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"regexp"
 	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -332,11 +335,62 @@ func (s *Syncer) resolveStartPosition() (mysql.Position, error) {
 	return s.querySourceMasterStatus()
 }
 
+// querySourceMasterStatus 用 SHOW MASTER STATUS 查源库当前 binlog tail。
+// 这是**"新起 CDC"从当前位置开始**的兜底路径 —— 不会拉历史。
 func (s *Syncer) querySourceMasterStatus() (mysql.Position, error) {
-	// 用 sql.Open 简单查一次
-	// 注意这里为了不引入循环依赖，用 database/sql 直连
-	// 这个函数只在启动时调一次，性能不敏感
-	return mysql.Position{}, fmt.Errorf("TODO: fallback to SHOW MASTER STATUS not implemented; set position_store.file or source.binlog_start")
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?timeout=5s",
+		s.cfg.Source.User, s.cfg.Source.Password, s.cfg.Source.Host, s.cfg.Source.Port)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return mysql.Position{}, fmt.Errorf("open source: %w", err)
+	}
+	defer db.Close()
+	rows, err := db.Query("SHOW MASTER STATUS")
+	if err != nil {
+		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS returned no row (binlog off?)")
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		return mysql.Position{}, err
+	}
+	// 前两列是 File 和 Position；其他列（Binlog_Do_DB / Ignore_DB / Executed_Gtid_Set）忽略
+	vals := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	if err := rows.Scan(ptrs...); err != nil {
+		return mysql.Position{}, err
+	}
+	var file string
+	var pos uint32
+	switch v := vals[0].(type) {
+	case []byte:
+		file = string(v)
+	case string:
+		file = v
+	}
+	switch v := vals[1].(type) {
+	case int64:
+		pos = uint32(v)
+	case []byte:
+		var p int64
+		_, _ = fmt.Sscanf(string(v), "%d", &p)
+		pos = uint32(p)
+	case string:
+		var p int64
+		_, _ = fmt.Sscanf(v, "%d", &p)
+		pos = uint32(p)
+	}
+	if file == "" {
+		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS: empty File")
+	}
+	log.Printf("[syncer] source tail: %s:%d", file, pos)
+	return mysql.Position{Name: file, Pos: pos}, nil
 }
 
 var currentBinlogFileVar string

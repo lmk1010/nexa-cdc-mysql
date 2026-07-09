@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -46,6 +47,12 @@ func main() {
 	defer func() { _ = w.Close() }()
 	log.Printf("[boot] sink connected: %s:%d/%s", cfg.Sink.Host, cfg.Sink.Port, cfg.Sink.Database)
 
+	// 确保 _canal_stats / _canal_errors 表存在（复用 canal 时代 schema，让运维监控无缝）
+	if err := stats.EnsureTables(context.Background(), w.DB()); err != nil {
+		log.Fatalf("[boot] ensure _canal_stats tables failed: %v", err)
+	}
+	log.Printf("[boot] _canal_stats / _canal_errors ready")
+
 	ps := position.NewStore(cfg.PositionStore.File)
 
 	sy, err := syncer.New(cfg, w, st, ps)
@@ -63,6 +70,9 @@ func main() {
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// 定期 flush 统计到 _canal_stats（60s 一次，跟 canal-consumer 保持一致）
+	stats.StartFlushLoop(ctx, w.DB(), st, 60*time.Second)
 
 	// SIGTERM / SIGINT 优雅退出
 	sigCh := make(chan os.Signal, 1)
