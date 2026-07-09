@@ -1,0 +1,33 @@
+# Dev overrides —— 只写覆盖字段。基础字段（tables/reconnect/http 等）继承 config.yaml。
+#
+# 用法：
+#   NEXA_CDC_ENV=dev ./nexa-cdc -c config.yaml
+#   → 会自动加载 config.yaml 后叠加 config.dev.yaml
+#
+# 或者敏感字段用环境变量：
+#   NEXA_CDC_SOURCE_PASSWORD=xxx ./nexa-cdc -c config.yaml
+
+source:
+  host: 127.0.0.1              # 本地 dev MySQL
+  port: 3306
+  user: root
+  password: "dev-password"
+  server_id: 2101              # dev 用不同 server_id，避免和生产撞
+
+sink:
+  host: 127.0.0.1
+  port: 3307                    # 本地 warehouse
+  user: root
+  password: "dev-password"
+  database: warehouse_dev
+
+position_store:
+  file: ./.dev-data/position.json
+
+http:
+  addr: 127.0.0.1:6060          # dev 只绑本地
+
+log:
+  level: debug                  # dev 更啰嗦
+
+mode: dry-run                   # dev 默认不写 sink（只解析验证）

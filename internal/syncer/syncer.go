@@ -30,6 +30,7 @@ type Syncer struct {
 	writer  *writer.Writer
 	stats   *stats.Stats
 	posStore *position.Store
+	schema   *SchemaCache
 
 	// 表匹配（编译好的正则）
 	includeRes []*regexp.Regexp
@@ -40,7 +41,10 @@ type Syncer struct {
 }
 
 func New(cfg *config.Config, w *writer.Writer, st *stats.Stats, ps *position.Store) (*Syncer, error) {
-	s := &Syncer{cfg: cfg, writer: w, stats: st, posStore: ps}
+	s := &Syncer{
+		cfg: cfg, writer: w, stats: st, posStore: ps,
+		schema: NewSchemaCache(&cfg.Source),
+	}
 	for _, pat := range cfg.Tables.Include {
 		re, err := regexp.Compile("^" + pat + "$")
 		if err != nil {
@@ -200,11 +204,27 @@ func opFromEventType(t replication.EventType) writer.Op {
 }
 
 // emitRows 从 RowsEvent 里剥出每一行并塞进 writer。
+//
+// 关键：列名和主键索引优先从 information_schema 拿（缓存），不依赖 binlog metadata。
+// 因为 CDB 默认 binlog_row_metadata=MINIMAL，e.Table 里那些字段是空的。
 func (s *Syncer) emitRows(ctx context.Context, e *replication.RowsEvent, srcSchema, srcTable, tgtTable string, op writer.Op, logPos uint32) error {
-	// UPDATE_ROWS：Rows 长度为偶数，成对是 [before, after]
-	// INSERT / DELETE：每一行一个 entry
-	cols := colNames(e)
-	pkIdx := pkIndex(e)
+	// 从 information_schema 拿真实结构
+	sch, err := s.schema.Get(srcSchema, srcTable)
+	if err != nil {
+		log.Printf("[syncer] schema fetch %s.%s failed: %v — skipping event", srcSchema, srcTable, err)
+		return nil
+	}
+	cols := sch.Columns
+	pkIdx := sch.PKIdx
+
+	// 校验：binlog 里的列数应该 = information_schema 列数
+	if int(e.ColumnCount) != len(cols) {
+		log.Printf("[syncer] column count mismatch on %s.%s (binlog=%d schema=%d) — invalidating cache & skipping",
+			srcSchema, srcTable, e.ColumnCount, len(cols))
+		s.schema.Invalidate(srcSchema, srcTable)
+		return nil
+	}
+
 	applyID := fmt.Sprintf("%s:%d", s.currentBinlogFile(), logPos)
 	at := time.Now()
 
@@ -222,8 +242,7 @@ func (s *Syncer) emitRows(ctx context.Context, e *replication.RowsEvent, srcSche
 		values := row
 		pkCols, pkVals := pickPK(cols, pkIdx, row)
 		if len(pkCols) == 0 {
-			// 没主键的表 —— 用全字段当条件（低效但至少不丢），先跳过警告
-			log.Printf("[syncer] table %s.%s has no pk in RowsEvent — skipping row", srcSchema, srcTable)
+			log.Printf("[syncer] table %s.%s has no PK — skipping row", srcSchema, srcTable)
 			continue
 		}
 

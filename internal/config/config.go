@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -94,15 +95,40 @@ type Log struct {
 }
 
 // Load 从 path 读 YAML，做简单校验并填默认值。
+//
+// Profile 支持：先读基础 path，再叠加 profile 文件（如果存在）。
+// 约定：环境变量 NEXA_CDC_ENV=prod|dev|... 时，尝试再加载
+//
+//	basename.$ENV.ext（比如 config.yaml → config.prod.yaml）
+//
+// 覆盖：profile 里出现的字段**替换**基础值。
+//
+// 敏感字段兜底：source.password / sink.password 允许用环境变量覆盖，
+// 让生产密码不入仓库：NEXA_CDC_SOURCE_PASSWORD / NEXA_CDC_SINK_PASSWORD。
 func Load(path string) (*Config, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
 	c := &Config{}
-	if err := yaml.Unmarshal(raw, c); err != nil {
-		return nil, fmt.Errorf("parse yaml: %w", err)
+	if err := loadYamlInto(path, c); err != nil {
+		return nil, err
 	}
+
+	if env := strings.TrimSpace(os.Getenv("NEXA_CDC_ENV")); env != "" {
+		if p := profilePath(path, env); p != "" {
+			if _, err := os.Stat(p); err == nil {
+				if err := loadYamlInto(p, c); err != nil {
+					return nil, fmt.Errorf("load profile %s: %w", p, err)
+				}
+			}
+		}
+	}
+
+	// 环境变量兜底（密码等敏感）
+	if v := os.Getenv("NEXA_CDC_SOURCE_PASSWORD"); v != "" {
+		c.Source.Password = v
+	}
+	if v := os.Getenv("NEXA_CDC_SINK_PASSWORD"); v != "" {
+		c.Sink.Password = v
+	}
+
 	c.applyDefaults()
 	if err := c.validate(); err != nil {
 		return nil, err
@@ -116,6 +142,26 @@ func Load(path string) (*Config, error) {
 		c.ShardRules[i].re = re
 	}
 	return c, nil
+}
+
+func loadYamlInto(path string, c *Config) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := yaml.Unmarshal(raw, c); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	return nil
+}
+
+// profilePath("config.yaml", "prod") → "config.prod.yaml"
+func profilePath(basePath, env string) string {
+	dot := strings.LastIndex(basePath, ".")
+	if dot <= 0 {
+		return basePath + "." + env
+	}
+	return basePath[:dot] + "." + env + basePath[dot:]
 }
 
 func (c *Config) applyDefaults() {

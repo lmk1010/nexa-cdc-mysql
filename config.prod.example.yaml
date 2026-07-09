@@ -1,0 +1,32 @@
+# Prod overrides —— 覆盖字段。基础字段继承 config.yaml。
+#
+# 建议：
+#   - 密码走环境变量（不入 git）：NEXA_CDC_SOURCE_PASSWORD / NEXA_CDC_SINK_PASSWORD
+#   - server_id 每个 prod 副本要不同
+#
+# 用法（docker）：
+#   docker run -d --name nexa-cdc \
+#     -e NEXA_CDC_ENV=prod \
+#     -e NEXA_CDC_SOURCE_PASSWORD="$SOURCE_PWD" \
+#     -e NEXA_CDC_SINK_PASSWORD="$SINK_PWD" \
+#     -v /opt/nexa-cdc:/etc/nexa-cdc \
+#     nexa-cdc:latest -c /etc/nexa-cdc/config.yaml
+
+source:
+  host: prod-cdb.example.com
+  port: 3306
+  user: canal
+  server_id: 1101
+
+sink:
+  host: warehouse.internal
+  port: 3306
+  user: root
+  database: ordersys_dw
+  max_conn: 8                   # prod 并发大点
+
+log:
+  level: info                   # prod 少啰嗦
+  format: json                  # prod 结构化日志便于采集
+
+mode: normal
