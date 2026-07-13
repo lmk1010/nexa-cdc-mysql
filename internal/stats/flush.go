@@ -48,6 +48,24 @@ func EnsureTables(ctx context.Context, db *sql.DB) error {
       INDEX idx_ts (ts)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
       COMMENT='CDC 应用失败明细'`,
+		`CREATE TABLE IF NOT EXISTS _canal_ddl_applied (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      ts DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+      hostname VARCHAR(64) NOT NULL,
+      src_schema VARCHAR(64) NOT NULL,
+      src_table VARCHAR(64) NOT NULL,
+      target_table VARCHAR(64) NOT NULL,
+      binlog_pos VARCHAR(128),
+      status VARCHAR(16) NOT NULL,
+      source_stmt TEXT NOT NULL,
+      applied_stmt TEXT,
+      err_msg TEXT,
+      PRIMARY KEY (id),
+      INDEX idx_ts (ts),
+      INDEX idx_table (src_table, ts),
+      INDEX idx_status (status, ts)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      COMMENT='CDC DDL 处理审计（applied/skipped/pending/failed）'`,
 	}
 	for _, q := range stmts {
 		if _, err := db.ExecContext(ctx, q); err != nil {

@@ -24,6 +24,15 @@ sink:
   batch_max_rows: 500
   # 批 flush 间隔 ms（不足 batch_max_rows 时也定期 commit）
   batch_flush_ms: 500
+  # DDL 自动同步策略（默认 off，安全兜底）
+  #   off              → 源库 ALTER TABLE 不影响 sink；schema 不一致时会靠 RowsEvent 列数
+  #                       校验 skip 保护，但你必须自己在 warehouse 上 ALTER 追平
+  #   log_only         → 仅落 _canal_ddl_applied (status=pending) 告警运维手动处理
+  #   add_column_only  → **推荐**。识别 ALTER TABLE 触发 info_schema diff，只自动补
+  #                       source 有 sink 没有的列（用 SHOW CREATE TABLE 抽原文列定义），
+  #                       其他 DDL（DROP/MODIFY/CHANGE/RENAME）仍走 log_only
+  #                       依赖：sink 账号有 ALTER 权限（EnsureTables 已经执行过 CREATE，通常已具备）
+  auto_ddl: off
 
 # 只同步这些表 —— 前缀匹配。分表 t_order_revoke_0..N 会被自动归一化到 t_order_revoke。
 tables:

@@ -132,3 +132,8 @@ func (c *SchemaCache) Invalidate(schema, table string) {
 	delete(c.tables, schema+"."+table)
 	c.mu.Unlock()
 }
+
+// SourceDB 暴露到 source information_schema 的连接，供 DDL 处理用。
+func (c *SchemaCache) SourceDB() (*sql.DB, error) {
+	return c.getDB()
+}

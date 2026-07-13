@@ -118,6 +118,15 @@ func (s *Stats) SetPosition(file string, pos uint32) {
 	s.promPosGauge.Set(float64(pos))
 }
 
+// Position 原子读取当前位点，用于持久化到 position.yaml。
+// 保证 file 和 pos 是同一时刻的快照（同一把锁下取）。
+func (s *Stats) Position() (file string, pos uint32) {
+	s.mu.Lock()
+	file, pos = s.BinlogFile, s.BinlogPos
+	s.mu.Unlock()
+	return
+}
+
 func (s *Stats) SetConnected(up bool) {
 	s.mu.Lock()
 	if up && !s.Connected {

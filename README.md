@@ -20,12 +20,13 @@ For most small-to-medium businesses (< 100 GB DBs, < 50 tables), a **single Go b
 - ✅ **Full-table initial load** — first time seeing a table? SELECT it fully, then switch to binlog
 - ✅ **Prometheus /metrics + /health** — ready for scraping
 - ✅ **`_canal_stats` compatible schema** — plugs into existing observability
+- ✅ **Whitelist DDL auto-apply** — `ALTER TABLE ... ADD COLUMN` on source auto-mirrors to sink (opt-in via `sink.auto_ddl: add_column_only`); every apply audited in `_canal_ddl_applied`
 
 ## Non-goals
 
 - HA / multi-master failover (single instance; use k8s deployment for HA)
 - Sink to Kafka / Redis / ES (this is MySQL → MySQL only; use `go-mysql-transfer` if you need MQ sinks)
-- DDL replay (we detect and warn, but you must apply DDL to warehouse manually)
+- Non-additive DDL replay (DROP/MODIFY/CHANGE/RENAME are **not** auto-applied — they land in `_canal_ddl_applied` as `pending` for ops review; risk of data loss is too high to automate)
 
 ## Quick start
 

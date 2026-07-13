@@ -56,7 +56,14 @@ func New(cfg *config.Config, w *writer.Writer, st *stats.Stats, ps *position.Sto
 }
 
 // Run 主循环：连接 → 消费 → 断了重连。
+//
+// 关停语义（SIGTERM → ctx cancel）：defer 里最后一次 commitPending —— 把 pending 批
+// commit 到 warehouse + 位点落盘。用独立 5s 超时 ctx 保证 cancel 后仍能写。
+// 这样优雅关停零丢失；强杀（kill -9）最坏丢 batch_flush_ms 窗口内未 commit 的数据，
+// 下次启动会从**上次成功 commit 的位点**续，通过 INSERT ... ON DUPLICATE KEY UPDATE 幂等重放。
 func (s *Syncer) Run(ctx context.Context) error {
+	defer s.finalFlush()
+
 	minBackoff := time.Duration(s.cfg.Reconnect.MinBackoffMs) * time.Millisecond
 	maxBackoff := time.Duration(s.cfg.Reconnect.MaxBackoffMs) * time.Millisecond
 	backoff := minBackoff
@@ -141,10 +148,8 @@ func (s *Syncer) runOnce(ctx context.Context) error {
 
 		select {
 		case <-flushTicker.C:
-			if s.writer.Pending() > 0 {
-				if err := s.writer.CommitBatch(ctx); err != nil {
-					return fmt.Errorf("flush tick: %w", err)
-				}
+			if err := s.commitPending(ctx); err != nil {
+				return fmt.Errorf("flush tick: %w", err)
 			}
 		default:
 		}
@@ -154,7 +159,7 @@ func (s *Syncer) runOnce(ctx context.Context) error {
 		}
 
 		if s.writer.Pending() >= s.cfg.Sink.BatchMaxRows {
-			if err := s.writer.CommitBatch(ctx); err != nil {
+			if err := s.commitPending(ctx); err != nil {
 				return fmt.Errorf("commit at max rows: %w", err)
 			}
 		}
@@ -181,12 +186,15 @@ func (s *Syncer) handleEvent(ctx context.Context, ev *replication.BinlogEvent) e
 		}
 		return s.emitRows(ctx, e, string(e.Table.Schema), string(e.Table.Table), targetTable, op, ev.Header.LogPos)
 	case *replication.XIDEvent:
-		// 事务提交边界：flush 当前批以保原子性
-		if s.writer.Pending() > 0 {
-			if err := s.writer.CommitBatch(ctx); err != nil {
-				return fmt.Errorf("commit xid: %w", err)
-			}
+		// 事务提交边界：flush 当前批以保原子性，位点跟着一起落盘
+		if err := s.commitPending(ctx); err != nil {
+			return fmt.Errorf("commit xid: %w", err)
 		}
+	case *replication.QueryEvent:
+		// DDL / BEGIN / SET 等语句级事件。handleDDL 内部会过滤 non-DDL 噪音，
+		// 并按 sink.auto_ddl 决定是否 apply。永远返回 nil：DDL 失败不重连。
+		pos := fmt.Sprintf("%s:%d", s.currentBinlogFile(), ev.Header.LogPos)
+		return s.handleDDL(ctx, string(e.Schema), string(e.Query), pos)
 	}
 	return nil
 }
@@ -336,22 +344,103 @@ func (s *Syncer) normalizeTable(schemaTable string) string {
 	return schemaTable
 }
 
-// resolveStartPosition 决定从哪儿开始 sync。
+// commitPending 提交 pending 批到 warehouse 并把位点落盘。
+// pending 为空时不 commit，但仍会把当前观测位点写入 position.yaml
+// —— 这样心跳/rotate 也能推进位点，重启不会回到很旧的地方。
+func (s *Syncer) commitPending(ctx context.Context) error {
+	if s.writer.Pending() > 0 {
+		if err := s.writer.CommitBatch(ctx); err != nil {
+			return err
+		}
+	}
+	s.savePosition()
+	return nil
+}
+
+// savePosition 把 stats 里的当前位点原子快照写到 position.yaml。
+// 失败只 log 不抛 —— 位点写失败不该中断数据流；下次 commit 会再试。
+func (s *Syncer) savePosition() {
+	file, pos := s.stats.Position()
+	if file == "" {
+		return
+	}
+	if err := s.posStore.SaveFile(mysql.Position{Name: file, Pos: pos}); err != nil {
+		log.Printf("[syncer] save position %s:%d failed: %v (non-fatal)", file, pos, err)
+	}
+}
+
+// finalFlush Run 退出前的兜底：用独立超时 ctx 尝试最后一次 commit+save。
+// 因为主 ctx 已经 cancel，任何用 ctx 的 DB op 会立即失败，所以必须自建 ctx。
+func (s *Syncer) finalFlush() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.commitPending(ctx); err != nil {
+		log.Printf("[syncer] final flush failed: %v — some events in last batch may need replay on restart", err)
+	} else {
+		file, pos := s.stats.Position()
+		log.Printf("[syncer] final flush ok, position saved: %s:%d", file, pos)
+	}
+}
+
+// resolveStartPosition 决定从哪儿开始 sync。优先级：
+//  1. 本地 position.yaml （每次 commit 都在更新，最新，通常都走这条）
+//  2. warehouse _canal_stats 里最近一条心跳的 last_apply_id （文件丢时兜底，最多 60s 旧）
+//  3. config.source.binlog_start
+//  4. SHOW MASTER STATUS （首次部署才走到这里，从当前 tail 开始，历史不追）
 func (s *Syncer) resolveStartPosition() (mysql.Position, error) {
-	// 1. 持久化文件
 	if p, ok := s.posStore.LoadFile(); ok {
-		log.Printf("[syncer] resume from persisted position %s:%d", p.Name, p.Pos)
+		log.Printf("[syncer] resume from persisted file %s:%d", p.Name, p.Pos)
 		return p, nil
 	}
-	// 2. config 里显式给的
+	if p, ok := s.loadPositionFromWarehouse(); ok {
+		log.Printf("[syncer] position.yaml missing — fallback to warehouse _canal_stats: %s:%d (最多 60s 旧，重放靠 ON DUPLICATE 幂等)", p.Name, p.Pos)
+		return p, nil
+	}
 	if s.cfg.Source.BinlogStart != nil && s.cfg.Source.BinlogStart.File != "" {
+		log.Printf("[syncer] no persisted position — using config binlog_start %s:%d", s.cfg.Source.BinlogStart.File, s.cfg.Source.BinlogStart.Position)
 		return mysql.Position{
 			Name: s.cfg.Source.BinlogStart.File,
 			Pos:  s.cfg.Source.BinlogStart.Position,
 		}, nil
 	}
-	// 3. 从当前 tail —— 用 SHOW MASTER STATUS 查
+	log.Printf("[syncer] no persisted position, no config start — falling back to source tail (首次启动预期路径；如果不是首次启动说明位点丢了，会漏一段数据)")
 	return s.querySourceMasterStatus()
+}
+
+// loadPositionFromWarehouse 从 warehouse 的 _canal_stats 心跳行拉最近一次位点。
+// 这是 position.yaml 丢失时的兜底 —— 心跳 60s 一次，所以最多回退 60s；
+// 回退窗口内的 event 会被重放，靠 INSERT ... ON DUPLICATE KEY UPDATE 幂等吸收。
+func (s *Syncer) loadPositionFromWarehouse() (mysql.Position, bool) {
+	row := s.writer.DB().QueryRow(
+		`SELECT last_apply_id FROM _canal_stats
+         WHERE table_name='__heartbeat__' AND last_apply_id IS NOT NULL AND last_apply_id != ''
+         ORDER BY id DESC LIMIT 1`)
+	var id string
+	if err := row.Scan(&id); err != nil {
+		return mysql.Position{}, false
+	}
+	return parseApplyID(id)
+}
+
+// parseApplyID 解析 "binlogFile:pos" 形式的 last_apply_id。
+// 从后往前找冒号 —— 万一 file 名字含冒号也不会切错（虽然 MySQL binlog 命名不含）。
+func parseApplyID(id string) (mysql.Position, bool) {
+	colon := -1
+	for i := len(id) - 1; i >= 0; i-- {
+		if id[i] == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon <= 0 || colon == len(id)-1 {
+		return mysql.Position{}, false
+	}
+	file := id[:colon]
+	var pos uint32
+	if _, err := fmt.Sscanf(id[colon+1:], "%d", &pos); err != nil {
+		return mysql.Position{}, false
+	}
+	return mysql.Position{Name: file, Pos: pos}, true
 }
 
 // querySourceMasterStatus 用 SHOW MASTER STATUS 查源库当前 binlog tail。

@@ -49,6 +49,13 @@ type Sink struct {
 	MaxConn      int    `yaml:"max_conn"`
 	BatchMaxRows int    `yaml:"batch_max_rows"`
 	BatchFlushMs int    `yaml:"batch_flush_ms"`
+
+	// AutoDDL 决定 QueryEvent（DDL）到达时的处理策略：
+	//   - "off"              什么都不做（默认，最保守）
+	//   - "log_only"         只落 _canal_ddl_applied 表告警，不执行
+	//   - "add_column_only"  白名单：只自动补 ADD COLUMN，其他一律 log_only 处理
+	// 不支持 DROP / MODIFY / RENAME / CHANGE 自动执行 —— 有丢数据风险，一律 log。
+	AutoDDL string `yaml:"auto_ddl"`
 }
 
 type Tables struct {
@@ -180,6 +187,9 @@ func (c *Config) applyDefaults() {
 	if c.Sink.BatchFlushMs == 0 {
 		c.Sink.BatchFlushMs = 500
 	}
+	if c.Sink.AutoDDL == "" {
+		c.Sink.AutoDDL = "off"
+	}
 	if c.InitialLoad.ChunkSize == 0 {
 		c.InitialLoad.ChunkSize = 5000
 	}
@@ -233,6 +243,11 @@ func (c *Config) validate() error {
 	}
 	if c.Mode != "normal" && c.Mode != "dry-run" {
 		return fmt.Errorf("mode must be normal or dry-run, got %q", c.Mode)
+	}
+	switch c.Sink.AutoDDL {
+	case "off", "log_only", "add_column_only":
+	default:
+		return fmt.Errorf("sink.auto_ddl must be off/log_only/add_column_only, got %q", c.Sink.AutoDDL)
 	}
 	return nil
 }
