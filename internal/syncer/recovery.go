@@ -191,6 +191,19 @@ func (s *Syncer) recoverGap(ctx context.Context) error {
 		return err
 	}
 	since := s.gapStartTime(ctx).Add(-time.Duration(s.cfg.GapRecovery.MarginMinutes) * time.Minute)
+	if s.cfg.GapRecovery.SkipBackfill {
+		if err := s.posStore.SaveFile(mysql.Position{Name: tail.Name, Pos: tail.Pos}); err != nil {
+			return fmt.Errorf("save tail position: %w", err)
+		}
+		s.setBinlogFile(tail.Name)
+		s.stats.SetPosition(tail.Name, tail.Pos)
+		msg := fmt.Sprintf("CDC binlog 断档：%s:%d 已被源库清理，跳到 %s:%d 恢复实时同步；%s 之后到现在的数据未补（skip_backfill）",
+			old.Name, old.Pos, tail.Name, tail.Pos, since.Format("2006-01-02 15:04"))
+		log.Printf("[gap] %s", msg)
+		s.reportError("__syncer__", "GAP", msg)
+		s.notifier.Notify("gap-start", msg)
+		return nil
+	}
 	// 先落补数任务，再改位点：中途崩了重启也能接着补
 	if err := s.saveBackfillState(&backfillState{
 		Since:     since.Format("2006-01-02 15:04:05"),

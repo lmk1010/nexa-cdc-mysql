@@ -31,7 +31,9 @@ type Config struct {
 // GapRecovery binlog 断档（位点已被源库清掉，ERROR 1236）时的自动恢复：
 // 跳到源库当前 tail 继续增量，同时后台按时间列把断档期间变更过的行从源库补回 warehouse。
 type GapRecovery struct {
-	Enabled         bool   `yaml:"enabled"`
+	Enabled bool `yaml:"enabled"`
+	// SkipBackfill 只跳位点恢复实时同步，不补断档期间的数据（缺口记 _canal_errors 待人工处理）
+	SkipBackfill    bool   `yaml:"skip_backfill"`
 	MarginMinutes   int    `yaml:"margin_minutes"`     // 断档起点再往前多补多少分钟，默认 60
 	ChunkSize       int    `yaml:"chunk_size"`         // 每次从源库拉多少行，默认 2000
 	FullCopyMaxRows int    `yaml:"full_copy_max_rows"` // 没有时间列的表，行数不超过它就整表补，默认 200000
