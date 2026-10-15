@@ -79,6 +79,8 @@ func (s *Syncer) Run(ctx context.Context) error {
 	s.ctx = ctx
 	// 上次没补完的断档数据，接着补
 	s.ResumeBackfill()
+	// 停机/断档期间源库加的列，补到 warehouse
+	go s.reconcileColumns(ctx)
 
 	minBackoff := time.Duration(s.cfg.Reconnect.MinBackoffMs) * time.Millisecond
 	maxBackoff := time.Duration(s.cfg.Reconnect.MaxBackoffMs) * time.Millisecond

@@ -237,3 +237,46 @@ func (s *Syncer) sourceNow(ctx context.Context) string {
 	}
 	return time.Now().Format("2006-01-02 15:04:05")
 }
+
+// reconcileColumns 启动时补列：源库（当年分表/普通表）有、warehouse 没有的列自动 ADD COLUMN。
+// 断档或停机期间源库加的列，DDL 事件已经错过，靠这个补上。只在 auto_ddl=add_column_only 时做。
+func (s *Syncer) reconcileColumns(ctx context.Context) {
+	if s.cfg.Sink.AutoDDL != "add_column_only" {
+		return
+	}
+	tables, err := s.listSourceTables(ctx, time.Now().Year())
+	if err != nil {
+		log.Printf("[reconcile] list source tables failed: %v", err)
+		return
+	}
+	srcDB, err := s.schema.SourceDB()
+	if err != nil {
+		return
+	}
+	for _, t := range tables {
+		sinkCols, err := listColumnNames(ctx, s.writer.DB(), s.cfg.Sink.Database, t.target)
+		if err != nil || len(sinkCols) == 0 {
+			continue // warehouse 没这张表：不自动建表
+		}
+		srcCols, err := listColumnNames(ctx, srcDB, t.schema, t.table)
+		if err != nil {
+			continue
+		}
+		have := map[string]bool{}
+		for _, c := range sinkCols {
+			have[strings.ToLower(c)] = true
+		}
+		missing := 0
+		for _, c := range srcCols {
+			if !have[strings.ToLower(c)] {
+				missing++
+			}
+		}
+		if missing == 0 {
+			continue
+		}
+		applied, skipped, failed := s.applyAddColumns(ctx, t.schema, t.table, t.target, "startup", "startup column reconcile")
+		s.writer.InvalidateSinkColumns(t.target)
+		log.Printf("[reconcile] %s.%s → %s: added %d column(s), skipped %d, failed %d", t.schema, t.table, t.target, applied, skipped, failed)
+	}
+}

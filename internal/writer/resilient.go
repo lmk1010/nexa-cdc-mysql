@@ -16,7 +16,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"sync"
 
@@ -30,14 +29,6 @@ type sinkColCache struct {
 	mu   sync.RWMutex
 	cols map[string]map[string]bool // table -> col set；空 map 表示表不存在
 }
-
-var hostname = func() string {
-	h, _ := os.Hostname()
-	if h == "" {
-		return "nexa-cdc"
-	}
-	return h
-}()
 
 // SetRowFailureHandler 由 syncer 注入（它持有源库连接，可以按主键回源重拉）。
 func (w *Writer) SetRowFailureHandler(h RowFailureHandler) { w.onRowFailure = h }
@@ -207,18 +198,22 @@ func (w *Writer) commitRowByRow(ctx context.Context, events []Event) (applied ma
 }
 
 // RecordError 写一行 _canal_errors（失败只打日志，不影响主流程）。
+// 兼容老 canal 时代的表结构：不写 hostname，长度按老表上限截断（event_type 8 / err_msg 1000 / sql_preview 500）。
 func (w *Writer) RecordError(ctx context.Context, table, eventType, rowID, msg, preview string) {
-	if len(rowID) > 64 {
-		rowID = rowID[:64]
-	}
-	if len(msg) > 4000 {
-		msg = msg[:4000]
-	}
 	if _, err := w.db.ExecContext(ctx,
-		`INSERT INTO _canal_errors (hostname, table_name, event_type, row_id, err_msg, sql_preview) VALUES (?, ?, ?, ?, ?, ?)`,
-		hostname, table, eventType, rowID, msg, preview); err != nil {
+		`INSERT INTO _canal_errors (table_name, event_type, row_id, err_msg, sql_preview) VALUES (?, ?, ?, ?, ?)`,
+		clip(table, 64), clip(eventType, 8), clip(rowID, 64), clip(msg, 1000), clip(preview, 500)); err != nil {
 		log.Printf("[writer] record _canal_errors failed: %v", err)
 	}
+}
+
+// clip 按字符截断（不切坏中文）。
+func clip(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 
 // UpsertRowsStrict 回源重拉用：写不进就返回错误，由调用方决定记录/跳过。

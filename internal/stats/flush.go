@@ -38,7 +38,7 @@ func EnsureTables(ctx context.Context, db *sql.DB) error {
 		`CREATE TABLE IF NOT EXISTS _canal_errors (
       id BIGINT NOT NULL AUTO_INCREMENT,
       ts DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-      hostname VARCHAR(64) NOT NULL,
+      hostname VARCHAR(64) NOT NULL DEFAULT '',
       table_name VARCHAR(64),
       event_type VARCHAR(32),
       row_id VARCHAR(64),
