@@ -14,6 +14,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/lmk1010/nexa-cdc-mysql/internal/alert"
 	"github.com/lmk1010/nexa-cdc-mysql/internal/config"
 	"github.com/lmk1010/nexa-cdc-mysql/internal/httpsrv"
 	"github.com/lmk1010/nexa-cdc-mysql/internal/position"
@@ -55,7 +56,8 @@ func main() {
 
 	ps := position.NewStore(cfg.PositionStore.File)
 
-	sy, err := syncer.New(cfg, w, st, ps)
+	notifier := alert.New(cfg.Alert.WebhookURL, cfg.Alert.Keyword)
+	sy, err := syncer.New(cfg, w, st, ps, notifier)
 	if err != nil {
 		log.Fatalf("[boot] syncer init failed: %v", err)
 	}

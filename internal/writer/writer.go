@@ -1,16 +1,18 @@
 // Package writer —— 把 binlog event 攒批 + 事务原子提交到 warehouse MySQL。
 //
 // 关键设计：
-//   1. **一个 XID 内的所有 event 一起 commit** —— 保证事务原子性。跨表的关联变更
-//      （比如一次业务操作改了 t_order + t_work_order）在 warehouse 里也一起可见。
-//   2. **超过 BatchMaxRows 或 BatchFlushMs 就 commit** —— 避免峰值堆积。
-//   3. **写失败自动 rollback**，上游 syncer 会重连从上次 ack 位点重发。
+//  1. **一个 XID 内的所有 event 一起 commit** —— 保证事务原子性。跨表的关联变更
+//     （比如一次业务操作改了 t_order + t_work_order）在 warehouse 里也一起可见。
+//  2. **超过 BatchMaxRows 或 BatchFlushMs 就 commit** —— 避免峰值堆积。
+//  3. **写失败自动 rollback**：可重试错误（断连/锁冲突）交给上游重连重放；
+//     数据类错误退化为逐行提交，坏行回源重拉或记 _canal_errors 跳过（见 resilient.go）。
 package writer
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -62,6 +64,9 @@ type Writer struct {
 	stats     *stats.Stats
 	pending   []Event
 	nextBatch int64
+
+	colCache     sinkColCache
+	onRowFailure RowFailureHandler
 }
 
 func New(cfg *config.Sink, st *stats.Stats) (*Writer, error) {
@@ -93,7 +98,7 @@ func (w *Writer) CommitBatch(ctx context.Context) error {
 	if len(w.pending) == 0 {
 		return nil
 	}
-	events := w.pending
+	events := w.projectEvents(ctx, w.pending)
 	w.pending = nil
 	w.nextBatch++
 
@@ -144,9 +149,13 @@ func (w *Writer) CommitBatch(ctx context.Context) error {
 			}
 		}
 		if err != nil {
-			errByTable[e0.Table] += len(bs)
 			_ = tx.Rollback()
-			return fmt.Errorf("apply %s to %s: %w", e0.Op, e0.Table, err)
+			if IsRetryable(err) {
+				return fmt.Errorf("apply %s to %s: %w", e0.Op, e0.Table, err)
+			}
+			// 数据类错误：逐行兜底，坏行跳过，流继续
+			log.Printf("[writer] batch apply %s to %s failed (%v) — falling back to row-by-row", e0.Op, e0.Table, err)
+			return w.finishRowByRow(ctx, events)
 		}
 		if bs[len(bs)-1].ApplyID > lastApplyID {
 			lastApplyID = bs[len(bs)-1].ApplyID
@@ -171,6 +180,31 @@ func (w *Writer) CommitBatch(ctx context.Context) error {
 	}
 	for t := range touched {
 		w.stats.Record(t, insByTable[t], updByTable[t], delByTable[t], errByTable[t], lastApplyID)
+	}
+	return nil
+}
+
+// finishRowByRow 逐行提交并记统计；只有可重试错误才返回 error。
+func (w *Writer) finishRowByRow(ctx context.Context, events []Event) error {
+	applied, failed, err := w.commitRowByRow(ctx, events)
+	lastApplyID := ""
+	if len(events) > 0 {
+		lastApplyID = events[len(events)-1].ApplyID
+	}
+	w.stats.IncBatch()
+	touched := map[string]bool{}
+	for t := range applied {
+		touched[t] = true
+	}
+	for t := range failed {
+		touched[t] = true
+	}
+	for t := range touched {
+		a := applied[t]
+		w.stats.Record(t, a[OpInsert], a[OpUpdate], a[OpDelete], failed[t], lastApplyID)
+	}
+	if err != nil {
+		return fmt.Errorf("row-by-row apply: %w", err)
 	}
 	return nil
 }

@@ -1,9 +1,10 @@
 // Package stats —— 运行时统计 + prometheus 指标 + _canal_stats 表兼容写入。
 //
 // _canal_stats 表结构和原 canal-consumer 一致，agent 的 /ops/canal-status 不用改：
-//   id BIGINT PK, ts DATETIME(3), hostname VARCHAR(64), table_name VARCHAR(64),
-//   ins_count INT, upd_count INT, del_count INT, err_count INT,
-//   last_apply_id VARCHAR(128), last_apply_at DATETIME(3)
+//
+//	id BIGINT PK, ts DATETIME(3), hostname VARCHAR(64), table_name VARCHAR(64),
+//	ins_count INT, upd_count INT, del_count INT, err_count INT,
+//	last_apply_id VARCHAR(128), last_apply_at DATETIME(3)
 package stats
 
 import (
@@ -41,6 +42,13 @@ type Stats struct {
 	Connected     bool
 	LastConnected time.Time
 	Reconnects    uint64
+
+	// 健康：连续失败（位点没前进）次数、最近错误、断档补数进度
+	FailStreak  int
+	FailSince   time.Time
+	LastError   string
+	LastErrorAt time.Time
+	Backfill    string
 
 	// prometheus
 	promInsCounter *prometheus.CounterVec
@@ -181,8 +189,49 @@ func (s *Stats) Snapshot() map[string]any {
 		"connected":      s.Connected,
 		"last_connected": s.LastConnected.Format(time.RFC3339),
 		"reconnects":     s.Reconnects,
+		"fail_streak":    s.FailStreak,
+		"last_error":     s.LastError,
+		"last_error_at":  s.LastErrorAt.Format(time.RFC3339),
+		"backfill":       s.Backfill,
 		"tables":         tables,
 	}
+}
+
+// MarkFailure 记一次「没有推进位点」的失败。
+func (s *Stats) MarkFailure(msg string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.FailStreak == 0 {
+		s.FailSince = time.Now()
+	}
+	s.FailStreak++
+	s.LastError = msg
+	s.LastErrorAt = time.Now()
+	return s.FailStreak
+}
+
+// MarkProgress 位点前进了，清零失败计数。
+func (s *Stats) MarkProgress() {
+	s.mu.Lock()
+	s.FailStreak = 0
+	s.FailSince = time.Time{}
+	s.mu.Unlock()
+}
+
+// Failing 返回连续失败次数和持续时长。
+func (s *Stats) Failing() (int, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.FailStreak == 0 {
+		return 0, 0
+	}
+	return s.FailStreak, time.Since(s.FailSince)
+}
+
+func (s *Stats) SetBackfill(msg string) {
+	s.mu.Lock()
+	s.Backfill = msg
+	s.mu.Unlock()
 }
 
 func (s *Stats) IncBatch() {

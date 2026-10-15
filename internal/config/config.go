@@ -24,6 +24,27 @@ type Config struct {
 	HTTP          HTTP          `yaml:"http"`
 	Log           Log           `yaml:"log"`
 	Mode          string        `yaml:"mode"` // normal / dry-run
+	GapRecovery   GapRecovery   `yaml:"gap_recovery"`
+	Alert         Alert         `yaml:"alert"`
+}
+
+// GapRecovery binlog 断档（位点已被源库清掉，ERROR 1236）时的自动恢复：
+// 跳到源库当前 tail 继续增量，同时后台按时间列把断档期间变更过的行从源库补回 warehouse。
+type GapRecovery struct {
+	Enabled         bool   `yaml:"enabled"`
+	MarginMinutes   int    `yaml:"margin_minutes"`     // 断档起点再往前多补多少分钟，默认 60
+	ChunkSize       int    `yaml:"chunk_size"`         // 每次从源库拉多少行，默认 2000
+	FullCopyMaxRows int    `yaml:"full_copy_max_rows"` // 没有时间列的表，行数不超过它就整表补，默认 200000
+	SleepMs         int    `yaml:"sleep_ms"`           // 每个窗口之间歇多久，默认 200，别把源库/小机打满
+	WindowRows      int    `yaml:"window_rows"`        // 每条 SQL 最多扫多少行主键，默认 20000
+	Window          string `yaml:"window"`             // 只在这个时段补数（Asia/Shanghai），如 "23:00-07:00"；空=随时
+}
+
+// Alert 出问题时推一条消息（钉钉/企业微信机器人或任意接收 JSON 的 webhook）。
+type Alert struct {
+	WebhookURL   string `yaml:"webhook_url"`
+	Keyword      string `yaml:"keyword"`       // 钉钉机器人安全关键词，会拼在消息开头
+	StallMinutes int    `yaml:"stall_minutes"` // 连续失败、位点不前进超过多少分钟告警，默认 10
 }
 
 type Source struct {
@@ -219,6 +240,24 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Mode == "" {
 		c.Mode = "normal"
+	}
+	if c.GapRecovery.MarginMinutes == 0 {
+		c.GapRecovery.MarginMinutes = 60
+	}
+	if c.GapRecovery.ChunkSize == 0 {
+		c.GapRecovery.ChunkSize = 2000
+	}
+	if c.GapRecovery.FullCopyMaxRows == 0 {
+		c.GapRecovery.FullCopyMaxRows = 200000
+	}
+	if c.GapRecovery.SleepMs == 0 {
+		c.GapRecovery.SleepMs = 200
+	}
+	if c.GapRecovery.WindowRows == 0 {
+		c.GapRecovery.WindowRows = 20000
+	}
+	if c.Alert.StallMinutes == 0 {
+		c.Alert.StallMinutes = 10
 	}
 }
 

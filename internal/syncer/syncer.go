@@ -1,9 +1,9 @@
 // Package syncer —— binlog 监听主循环 + 事务分界 + 分表归一化 + 断线重连。
 //
 // 相对 canal 的价值：
-//   1. **单进程无子进程** —— Go 崩了 docker 立即感知，无 canal 那种"shell 活 Java 死"
-//   2. **idle 超时主动重连** —— 60 秒没收到 event 就 disconnect 重来（canal 静默死会永不恢复）
-//   3. **XID 分界原子提交** —— 一次事务的多表变更一起写入 warehouse
+//  1. **单进程无子进程** —— Go 崩了 docker 立即感知，无 canal 那种"shell 活 Java 死"
+//  2. **idle 超时主动重连** —— 60 秒没收到 event 就 disconnect 重来（canal 静默死会永不恢复）
+//  3. **XID 分界原子提交** —— 一次事务的多表变更一起写入 warehouse
 package syncer
 
 import (
@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -19,6 +20,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 
+	"github.com/lmk1010/nexa-cdc-mysql/internal/alert"
 	"github.com/lmk1010/nexa-cdc-mysql/internal/config"
 	"github.com/lmk1010/nexa-cdc-mysql/internal/position"
 	"github.com/lmk1010/nexa-cdc-mysql/internal/stats"
@@ -26,9 +28,9 @@ import (
 )
 
 type Syncer struct {
-	cfg     *config.Config
-	writer  *writer.Writer
-	stats   *stats.Stats
+	cfg      *config.Config
+	writer   *writer.Writer
+	stats    *stats.Stats
 	posStore *position.Store
 	schema   *SchemaCache
 
@@ -38,13 +40,24 @@ type Syncer struct {
 
 	// 每次 dial 一个新 BinlogSyncer 实例，断了就重建
 	binlogSyncer *replication.BinlogSyncer
+
+	// 自愈相关
+	notifier     *alert.Notifier
+	src          srcData
+	ctx          context.Context
+	bfRunning    atomic.Bool
+	lastSavedPos mysql.Position
 }
 
-func New(cfg *config.Config, w *writer.Writer, st *stats.Stats, ps *position.Store) (*Syncer, error) {
+func New(cfg *config.Config, w *writer.Writer, st *stats.Stats, ps *position.Store, n *alert.Notifier) (*Syncer, error) {
 	s := &Syncer{
 		cfg: cfg, writer: w, stats: st, posStore: ps,
-		schema: NewSchemaCache(&cfg.Source),
+		schema:   NewSchemaCache(&cfg.Source),
+		notifier: n,
+		ctx:      context.Background(),
 	}
+	// 坏行兜底：回源按主键重拉
+	w.SetRowFailureHandler(s.refetchRow)
 	for _, pat := range cfg.Tables.Include {
 		re, err := regexp.Compile("^" + pat + "$")
 		if err != nil {
@@ -63,6 +76,9 @@ func New(cfg *config.Config, w *writer.Writer, st *stats.Stats, ps *position.Sto
 // 下次启动会从**上次成功 commit 的位点**续，通过 INSERT ... ON DUPLICATE KEY UPDATE 幂等重放。
 func (s *Syncer) Run(ctx context.Context) error {
 	defer s.finalFlush()
+	s.ctx = ctx
+	// 上次没补完的断档数据，接着补
+	s.ResumeBackfill()
 
 	minBackoff := time.Duration(s.cfg.Reconnect.MinBackoffMs) * time.Millisecond
 	maxBackoff := time.Duration(s.cfg.Reconnect.MaxBackoffMs) * time.Millisecond
@@ -80,6 +96,11 @@ func (s *Syncer) Run(ctx context.Context) error {
 			log.Printf("[syncer] runOnce error: %v — reconnect in %s", err, backoff)
 			s.stats.SetConnected(false)
 			s.stats.IncReconnect()
+			if s.onRunError(ctx, err) {
+				// 断档已自动跳位点：立即重连，不退避
+				backoff = minBackoff
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -227,10 +248,32 @@ func (s *Syncer) emitRows(ctx context.Context, e *replication.RowsEvent, srcSche
 
 	// 校验：binlog 里的列数应该 = information_schema 列数
 	if int(e.ColumnCount) != len(cols) {
-		log.Printf("[syncer] column count mismatch on %s.%s (binlog=%d schema=%d) — invalidating cache & skipping",
-			srcSchema, srcTable, e.ColumnCount, len(cols))
+		// 结构变了：先刷新缓存再比一次
 		s.schema.Invalidate(srcSchema, srcTable)
-		return nil
+		if sch2, err2 := s.schema.Get(srcSchema, srcTable); err2 == nil && int(e.ColumnCount) == len(sch2.Columns) {
+			cols, pkIdx = sch2.Columns, sch2.PKIdx
+		} else {
+			// 还对不上（binlog 里是改表前的旧行）：不丢数据，按主键回源重拉当前行。
+			// 先把 pending 提交，保证回源写入不会被同批里更旧的事件覆盖。
+			log.Printf("[syncer] column count mismatch on %s.%s (binlog=%d schema=%d) — refetching rows by PK",
+				srcSchema, srcTable, e.ColumnCount, len(cols))
+			if err := s.commitPending(ctx); err != nil {
+				return err
+			}
+			for _, row := range e.Rows {
+				pkCols, pkVals := pickPK(cols, pkIdx, row)
+				if len(pkCols) == 0 || len(pkVals) != len(pkCols) {
+					continue
+				}
+				if err := s.refetchByPK(ctx, srcSchema, srcTable, tgtTable, pkCols, pkVals); err != nil {
+					if writer.IsRetryable(err) {
+						return err
+					}
+					s.reportError(tgtTable, "SCHEMA", fmt.Sprintf("refetch %s.%s pk=%v failed: %v", srcSchema, srcTable, pkVals, err))
+				}
+			}
+			return nil
+		}
 	}
 
 	applyID := fmt.Sprintf("%s:%d", s.currentBinlogFile(), logPos)
@@ -364,8 +407,14 @@ func (s *Syncer) savePosition() {
 	if file == "" {
 		return
 	}
-	if err := s.posStore.SaveFile(mysql.Position{Name: file, Pos: pos}); err != nil {
+	p := mysql.Position{Name: file, Pos: pos}
+	if err := s.posStore.SaveFile(p); err != nil {
 		log.Printf("[syncer] save position %s:%d failed: %v (non-fatal)", file, pos, err)
+		return
+	}
+	if p.Compare(s.lastSavedPos) > 0 {
+		s.lastSavedPos = p
+		s.stats.MarkProgress()
 	}
 }
 
@@ -485,6 +534,12 @@ func (s *Syncer) querySourceMasterStatus() (mysql.Position, error) {
 	switch v := vals[1].(type) {
 	case int64:
 		pos = uint32(v)
+	case uint64:
+		pos = uint32(v)
+	case int32:
+		pos = uint32(v)
+	case uint32:
+		pos = v
 	case []byte:
 		var p int64
 		_, _ = fmt.Sscanf(string(v), "%d", &p)
@@ -496,6 +551,9 @@ func (s *Syncer) querySourceMasterStatus() (mysql.Position, error) {
 	}
 	if file == "" {
 		return mysql.Position{}, fmt.Errorf("SHOW MASTER STATUS: empty File")
+	}
+	if pos < 4 {
+		pos = 4 // binlog 文件头之后的第一个事件
 	}
 	log.Printf("[syncer] source tail: %s:%d", file, pos)
 	return mysql.Position{Name: file, Pos: pos}, nil

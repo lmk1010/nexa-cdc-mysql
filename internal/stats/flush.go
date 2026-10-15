@@ -2,9 +2,9 @@
 // 监控数据无缝延续，agent 端 /ops/canal-status 不用改。
 //
 // 每 60 秒：
-//   1. 上报心跳（table_name = '__heartbeat__'）—— 用于判定 consumer 存活
-//   2. 每张表落一行统计（ins/upd/del/err 24h 汇总由 SQL 侧算）
-//   3. 落 last_apply_id（binlogFile:pos）
+//  1. 上报心跳（table_name = '__heartbeat__'）—— 用于判定 consumer 存活
+//  2. 每张表落一行统计（ins/upd/del/err 24h 汇总由 SQL 侧算）
+//  3. 落 last_apply_id（binlogFile:pos）
 package stats
 
 import (
@@ -77,9 +77,9 @@ func EnsureTables(ctx context.Context, db *sql.DB) error {
 
 // StartFlushLoop 定期把 stats 落到 _canal_stats。
 // 一次 flush 会：
-//   1. 心跳一行（table_name=__heartbeat__）
-//   2. 每张有活动的表落一行 24h 累加
-//   3. 快照后清零本地累积（下次 flush 只报增量）
+//  1. 心跳一行（table_name=__heartbeat__）
+//  2. 每张有活动的表落一行 24h 累加
+//  3. 快照后清零本地累积（下次 flush 只报增量）
 func StartFlushLoop(ctx context.Context, db *sql.DB, s *Stats, interval time.Duration) {
 	hostname, _ := os.Hostname()
 	if hostname == "" {

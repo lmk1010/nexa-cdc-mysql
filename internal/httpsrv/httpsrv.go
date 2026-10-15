@@ -17,9 +17,14 @@ func New(addr string, st *stats.Stats, reg *prometheus.Registry) *http.Server {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		snap := st.Snapshot()
 		up := snap["connected"] == true
-		if !up {
+		// 连续失败、位点不前进也算不健康（2026-09 那次就是「连着但一直重放同一段」）
+		streak, _ := st.Failing()
+		if !up || streak >= 5 {
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(`{"status":"down"}`))
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "down", "connected": up, "fail_streak": streak, "last_error": snap["last_error"],
+			})
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

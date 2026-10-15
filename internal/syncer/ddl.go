@@ -124,6 +124,8 @@ func (s *Syncer) handleDDL(ctx context.Context, defaultSchema, query, binlogPos 
 
 	// add_column_only 模式：走 diff 补齐
 	applied, skipped, failed := s.applyAddColumns(ctx, schema, table, targetTable, binlogPos, query)
+	// warehouse 加了列，让写入层重读列清单
+	s.writer.InvalidateSinkColumns(targetTable)
 	if failed > 0 {
 		log.Printf("[ddl] %s.%s → %s : applied=%d skipped=%d failed=%d",
 			schema, table, targetTable, applied, skipped, failed)
