@@ -286,6 +286,15 @@ func (s *Syncer) runBackfill(ctx context.Context) error {
 	return nil
 }
 
+func (s *Syncer) isAppendTable(table string) bool {
+	for _, p := range s.cfg.GapRecovery.AppendTables {
+		if re, err := regexp.Compile("^" + p + "$"); err == nil && re.MatchString(table) {
+			return true
+		}
+	}
+	return false
+}
+
 func (st *backfillState) prevPassStart() string {
 	if m := st.Tables["_pass0_start"]; m != nil && m.Cursor != "" {
 		if t, err := time.ParseInLocation("2006-01-02 15:04:05", m.Cursor, time.Local); err == nil {
@@ -312,6 +321,10 @@ func (s *Syncer) backfillTable(ctx context.Context, st *backfillState, key strin
 		return nil
 	}
 	mode := "time"
+	// 没有 update_time：追加型表只补新行；其余整表重拷
+	if !strings.EqualFold(t.timeCol, "update_time") && !s.isAppendTable(t.table) {
+		t.timeCol = ""
+	}
 	if t.timeCol == "" {
 		if t.rowsEst > int64(cfg.FullCopyMaxRows) {
 			bt.Done, bt.Mode, bt.Note = true, "skip", "no time column and too large for full copy"
@@ -320,6 +333,12 @@ func (s *Syncer) backfillTable(ctx context.Context, st *backfillState, key strin
 			return nil
 		}
 		mode = "full"
+		if st.Pass == 1 {
+			// 整表重拷的表复扫没意义（又是一遍全表），竞态窗口内的变更 binlog 已经在写
+			bt.Done, bt.Mode = true, "full-skip-pass1"
+			save()
+			return nil
+		}
 	}
 	// 只有 create_time 的追加型表：直接从 warehouse 已有最大主键往后读
 	if mode == "time" && !strings.EqualFold(t.timeCol, "update_time") && bt.Cursor == "" {

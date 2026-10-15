@@ -37,7 +37,10 @@ type GapRecovery struct {
 	FullCopyMaxRows int    `yaml:"full_copy_max_rows"` // 没有时间列的表，行数不超过它就整表补，默认 200000
 	SleepMs         int    `yaml:"sleep_ms"`           // 每个窗口之间歇多久，默认 200，别把源库/小机打满
 	WindowRows      int    `yaml:"window_rows"`        // 每条 SQL 最多扫多少行主键，默认 20000
-	Window          string `yaml:"window"`             // 只在这个时段补数（Asia/Shanghai），如 "23:00-07:00"；空=随时
+	Window          string `yaml:"window"`             // 只在这个时段补数（Asia/Shanghai），如 "09:00-18:00"；空=随时
+	// AppendTables 只增不改的表（正则，匹配源表名），没有 update_time 时只从 warehouse 最大主键往后读。
+	// 其余没有 update_time 的表整表重拷（旧行的修改没有时间列可判断）。
+	AppendTables []string `yaml:"append_tables"`
 }
 
 // Alert 出问题时推一条消息（钉钉/企业微信机器人或任意接收 JSON 的 webhook）。
@@ -248,7 +251,7 @@ func (c *Config) applyDefaults() {
 		c.GapRecovery.ChunkSize = 2000
 	}
 	if c.GapRecovery.FullCopyMaxRows == 0 {
-		c.GapRecovery.FullCopyMaxRows = 200000
+		c.GapRecovery.FullCopyMaxRows = 5000000
 	}
 	if c.GapRecovery.SleepMs == 0 {
 		c.GapRecovery.SleepMs = 200

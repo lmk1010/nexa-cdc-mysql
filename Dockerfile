@@ -6,9 +6,10 @@
 #     -o dist/nexa-cdc-linux-amd64 ./cmd/nexa-cdc
 #   docker build --platform linux/amd64 -t nexa-cdc:latest .
 
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata wget && \
-    adduser -D -u 1000 nexa && \
+# 时区数据已编进二进制（time/tzdata），健康检查用 busybox 自带 wget，不再 apk 联网装包。
+ARG BASE_IMAGE=alpine:3.21
+FROM ${BASE_IMAGE}
+RUN adduser -D -u 1000 nexa && \
     mkdir -p /etc/nexa-cdc /var/lib/nexa-cdc && \
     chown -R nexa:nexa /var/lib/nexa-cdc
 
